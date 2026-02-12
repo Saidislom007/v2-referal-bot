@@ -3,6 +3,15 @@ from typing import List, Optional, Tuple, Dict, Any
 
 from config import DATABASE_URL, ENV_ADMIN_IDS
 
+# ixtiyoriy env config (bo'lmasa default ishlaydi)
+try:
+    from config import DB_POOL_MIN, DB_POOL_MAX, DB_COMMAND_TIMEOUT, DB_MAX_INACTIVE_LIFETIME
+except Exception:
+    DB_POOL_MIN = 1
+    DB_POOL_MAX = 8
+    DB_COMMAND_TIMEOUT = 30
+    DB_MAX_INACTIVE_LIFETIME = 60
+
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -11,13 +20,21 @@ _pool: Optional[asyncpg.Pool] = None
 # Connection / Init
 # =========================
 async def db_connect() -> asyncpg.Pool:
+    """
+    Global asyncpg pool.
+    Webhookda concurrency oshadi — pool paramlarini env orqali boshqarish muhim.
+    """
     global _pool
     if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL topilmadi")
+
         _pool = await asyncpg.create_pool(
             dsn=DATABASE_URL,
-            min_size=1,
-            max_size=10,
-            command_timeout=60,
+            min_size=int(DB_POOL_MIN),
+            max_size=int(DB_POOL_MAX),
+            command_timeout=int(DB_COMMAND_TIMEOUT),
+            max_inactive_connection_lifetime=int(DB_MAX_INACTIVE_LIFETIME),
         )
     return _pool
 
@@ -30,6 +47,9 @@ async def db_close() -> None:
 
 
 async def db_init() -> None:
+    """
+    Schema + defaults + env adminlar.
+    """
     pool = await db_connect()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -64,6 +84,8 @@ async def db_init() -> None:
               created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """)
+            # invited_user_id PRIMARY KEY bo'lgani uchun unique index shart emas,
+            # lekin oldingi DB bilan moslik uchun qoldiramiz
             await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_referrals_invited ON referrals(invited_user_id);")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_referrals_credited_referrer ON referrals(referrer_id, credited);")
 
@@ -195,8 +217,10 @@ async def get_setting(key: str, default: str = "") -> str:
 
 
 async def fix_referrals_duplicates() -> None:
-    # Postgres’da invited_user_id PRIMARY KEY bo‘lgani uchun amalda duplicate bo‘lmaydi.
-    # Lekin eski DB’dan migrate qilganda ehtiyot uchun qoldirdim.
+    """
+    invited_user_id PRIMARY KEY bo'lgani uchun real duplicate bo'lmaydi,
+    lekin eski bazadan migrate bo'lsa ehtiyot uchun.
+    """
     pool = await db_connect()
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -258,34 +282,26 @@ async def admin_list() -> List[int]:
 
 
 async def upsert_user(user_id: int, username: str, first_name: str, referrer_id: Optional[int]) -> None:
+    """
+    Webhookda eng ko'p uriladigan joy.
+    Oldingi variant (SELECT -> INSERT/UPDATE) race + 2ta query edi.
+    Bu variant 1 ta UPSERT query: tezroq + xavfsizroq.
+
+    referrer_id faqat users.referrer_id NULL bo'lsa qo'yiladi.
+    """
     if referrer_id == user_id:
         referrer_id = None
 
     pool = await db_connect()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow("SELECT referrer_id FROM users WHERE user_id=$1", int(user_id))
-
-            if row is None:
-                await conn.execute("""
-                    INSERT INTO users(user_id, username, first_name, referrer_id, verified)
-                    VALUES($1, $2, $3, $4, FALSE)
-                """, int(user_id), username, first_name, referrer_id)
-                return
-
-            existing_ref = row["referrer_id"]
-            if existing_ref is None and referrer_id is not None:
-                await conn.execute("""
-                    UPDATE users
-                    SET referrer_id=$1, username=$2, first_name=$3
-                    WHERE user_id=$4
-                """, referrer_id, username, first_name, int(user_id))
-            else:
-                await conn.execute("""
-                    UPDATE users
-                    SET username=$1, first_name=$2
-                    WHERE user_id=$3
-                """, username, first_name, int(user_id))
+        await conn.execute("""
+            INSERT INTO users(user_id, username, first_name, referrer_id, verified)
+            VALUES($1, $2, $3, $4, FALSE)
+            ON CONFLICT (user_id) DO UPDATE
+            SET username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                referrer_id = COALESCE(users.referrer_id, EXCLUDED.referrer_id)
+        """, int(user_id), username, first_name, referrer_id)
 
 
 async def set_verified(user_id: int, verified: bool) -> None:
@@ -329,8 +345,12 @@ async def get_all_user_ids() -> List[int]:
 # Referrals / Scoring
 # =========================
 async def ensure_referral(invited_user_id: int, referrer_id: int) -> None:
+    """
+    invited_user_id PRIMARY KEY bo'lgani uchun ON CONFLICT DO NOTHING idempotent.
+    """
     if invited_user_id == referrer_id:
         return
+
     pool = await db_connect()
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -341,6 +361,10 @@ async def ensure_referral(invited_user_id: int, referrer_id: int) -> None:
 
 
 async def credit_referrer_if_needed(invited_user_id: int) -> Optional[int]:
+    """
+    Verified bo'lganda 1 martagina credited=TRUE bo'ladi.
+    FOR UPDATE -> retry/parallel update kelganda ham dublikat credit bo'lmaydi.
+    """
     pool = await db_connect()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -357,6 +381,7 @@ async def credit_referrer_if_needed(invited_user_id: int) -> Optional[int]:
                 WHERE invited_user_id=$1
                 FOR UPDATE
             """, int(invited_user_id))
+
             if not r or bool(r["credited"]) is True:
                 return None
 
@@ -446,7 +471,7 @@ async def prize_list() -> List[asyncpg.Record]:
 
 
 # =========================
-# TZ: Konkursni tugatish + Umumiy tozalash
+# Contest cleanup / Reset
 # =========================
 async def _keep_only_env_admins(conn: asyncpg.Connection) -> None:
     if ENV_ADMIN_IDS:
@@ -457,6 +482,7 @@ async def _keep_only_env_admins(conn: asyncpg.Connection) -> None:
         )
     else:
         await conn.execute("DELETE FROM admins")
+
 
 async def reset_all_data(
     *,
@@ -514,7 +540,9 @@ async def contest_finish_and_clear_users(
     )
 
 
-# -------- channels --------
+# =========================
+# Channels
+# =========================
 async def channel_add(username: str) -> None:
     username = username.strip()
     if not username:
