@@ -15,7 +15,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-ADMIN_IDS = {
+ENV_ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 }
